@@ -1,0 +1,248 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+      "sourceStorageAccountName": {
+        "type": "string",
+        "metadata": {
+          "description": "Name for the source storage account."
+        }
+      },
+      "destinationStorageAccountName": {
+        "type": "string",
+        "metadata": {
+          "description": "Name for the destination storage account."
+        }
+      },
+      "mainQueueName": {
+        "type": "string",
+        "defaultValue": "blobuploadqueue",
+        "metadata": {
+          "description": "Name for the main storage queue."
+        }
+      },
+      "functionAppName": {
+        "type": "string",
+        "metadata": {
+          "description": "Name for the Azure Function App."
+        }
+      },
+      "slackWebhookUrl": {
+        "type": "secureString",
+        "metadata": {
+          "description": "Slack webhook URL for notifications."
+        }
+      }
+    },
+    "variables": {
+      "blobUploadTopic": "[concat('blobupload-topic-', uniqueString(resourceGroup().id))]",
+      "poisonQueueName": "[concat('poison-', parameters('mainQueueName'))]"
+    },
+    "resources": [
+      {
+        "type": "Microsoft.Storage/storageAccounts",
+        "apiVersion": "2019-06-01",
+        "name": "[parameters('sourceStorageAccountName')]",
+        "location": "[resourceGroup().location]",
+        "sku": {
+          "name": "Standard_LRS",
+          "tier": "Standard"
+        },
+        "kind": "StorageV2",
+        "properties": {}
+      },
+      {
+        "type": "Microsoft.Storage/storageAccounts",
+        "apiVersion": "2019-06-01",
+        "name": "[parameters('destinationStorageAccountName')]",
+        "location": "[resourceGroup().location]",
+        "sku": {
+          "name": "Standard_LRS",
+          "tier": "Standard"
+        },
+        "kind": "StorageV2",
+        "properties": {}
+      },
+      {
+        "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+        "apiVersion": "2019-06-01",
+        "name": "[concat(parameters('sourceStorageAccountName'), '/default/', 'container1')]",
+        "dependsOn": [
+          "[resourceId('Microsoft.Storage/storageAccounts', parameters('sourceStorageAccountName'))]"
+        ],
+        "properties": {
+          "publicAccess": "None"
+        }
+      },
+      {
+        "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+        "apiVersion": "2019-06-01",
+        "name": "[concat(parameters('destinationStorageAccountName'), '/default/', 'container2')]",
+        "dependsOn": [
+          "[resourceId('Microsoft.Storage/storageAccounts', parameters('destinationStorageAccountName'))]"
+        ],
+        "properties": {
+          "publicAccess": "None"
+        }
+      },
+      {
+        "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+        "apiVersion": "2019-06-01",
+        "name": "[concat(parameters('sourceStorageAccountName'), '/default/', parameters('mainQueueName'))]",
+        "dependsOn": [
+          "[resourceId('Microsoft.Storage/storageAccounts', parameters('sourceStorageAccountName'))]"
+        ]
+      },
+      {
+        "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+        "apiVersion": "2019-06-01",
+        "name": "[concat(parameters('destinationStorageAccountName'), '/default/', variables('poisonQueueName'))]",
+        "dependsOn": [
+          "[resourceId('Microsoft.Storage/storageAccounts', parameters('destinationStorageAccountName'))]"
+        ]
+      },
+      {
+        "type": "Microsoft.EventGrid/topics",
+        "apiVersion": "2020-06-01",
+        "name": "[variables('blobUploadTopic')]",
+        "location": "[resourceGroup().location]",
+        "tags": {
+          "displayName": "BlobUploadTopic"
+        }
+      },
+      {
+        "type": "Microsoft.EventGrid/topics/eventSubscriptions",
+        "apiVersion": "2020-06-01",
+        "name": "[concat(variables('blobUploadTopic'), '/blobUploadSubscription')]",
+        "dependsOn": [
+          "[resourceId('Microsoft.EventGrid/topics', variables('blobUploadTopic'))]",
+          "[resourceId('Microsoft.Storage/storageAccounts', parameters('sourceStorageAccountName'))]"
+        ],
+        "properties": {
+          "destination": {
+            "endpointType": "AzureFunction",
+            "properties": {
+              "resourceId": "[resourceId('Microsoft.Web/sites/functions', concat(parameters('functionAppName'), '/uploadFunction'))]",
+              "maxEventsPerBatch": 1
+            }
+          },
+          "filter": {
+            "subjectBeginsWith": "/blobServices/default/containers/container1/"
+          }
+        }
+      },
+      {
+        "type": "Microsoft.Web/sites",
+        "apiVersion": "2020-06-01",
+        "name": "[parameters('functionAppName')]",
+        "location": "[resourceGroup().location]",
+        "kind": "functionapp",
+        "properties": {
+          "siteConfig": {
+            "appSettings": [
+              {
+                "name": "AzureWebJobsStorage",
+                "value": "[concat('DefaultEndpointsProtocol=https;AccountName=', parameters('sourceStorageAccountName'), ';EndpointSuffix=', environment().suffixes.storage, ';AccountKey=', listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('sourceStorageAccountName')), '2019-06-01').keys[0].value)]"
+              },
+              {
+                "name": "DestinationStorageAccount",
+                "value": "[parameters('destinationStorageAccountName')]"
+              },
+              {
+                "name": "FUNCTIONS_EXTENSION_VERSION",
+                "value": "~3"
+              },
+              {
+                "name": "FUNCTIONS_WORKER_RUNTIME",
+                "value": "python"
+              },
+              {
+                "name": "SlackWebhookUri",
+                "value": "[parameters('slackWebhookUrl')]"
+              }
+            ]
+          }
+        },
+        "resources": [
+          {
+            "name": "uploadFunction",
+            "type": "functions",
+            "apiVersion": "2020-06-01",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+              "[resourceId('Microsoft.Web/sites', parameters('functionAppName'))]"
+            ],
+            "properties": {
+              "config": {
+                "bindings": [
+                  {
+                    "type": "eventGridTrigger",
+                    "name": "eventGridEvent",
+                    "direction": "in"
+                  },
+                  {
+                    "type": "blob",
+                    "name": "inputBlob",
+                    "path": "container1/{name}",
+                    "connection": "AzureWebJobsStorage",
+                    "direction": "in"
+                  },
+                  {
+                    "type": "blob",
+                    "name": "outputBlob",
+                    "path": "container2/{name}",
+                    "connection": "AzureWebJobsStorage",
+                    "direction": "out"
+                  },
+                  {
+                    "type": "queue",
+                    "name": "poisonQueue",
+                    "queueName": "%PoisonQueueName%",
+                    "connection": "AzureWebJobsStorage",
+                    "direction": "out"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/queueServices/queues/messages",
+      "apiVersion": "2019-06-01",
+      "name": "[concat(parameters('sourceStorageAccountName'), '/default/', parameters('mainQueueName'), '/trigger-', uniqueString(resourceGroup().id))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('sourceStorageAccountName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts/queueServices/queues', parameters('sourceStorageAccountName'), 'default', parameters('mainQueueName'))]"
+      ],
+      "properties": {
+        "message": {
+          "visibilityTimeout": "PT1M",
+          "content": "{ 'blobPath': 'container1/{name}', 'retryCount': 0 }"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "sourceStorageAccountName": {
+      "type": "string",
+      "value": "[parameters('sourceStorageAccountName')]"
+    },
+    "destinationStorageAccountName": {
+      "type": "string",
+      "value": "[parameters('destinationStorageAccountName')]"
+    },
+    "mainQueueName": {
+      "type": "string",
+      "value": "[parameters('mainQueueName')]"
+    },
+    "poisonQueueName": {
+      "type": "string",
+      "value": "[variables('poisonQueueName')]"
+    },
+    "functionAppName": {
+      "type": "string",
+      "value": "[parameters('functionAppName')]"
+    }
+  }
+}
